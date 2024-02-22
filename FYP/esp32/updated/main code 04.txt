@@ -1,0 +1,251 @@
+#define CUSTOM_SETTINGS
+#define INCLUDE_SENSOR_MODULE
+#define INCLUDE_GAMEPAD_MODULE
+#define INCLUDE_NOTIFICATION_MODULE
+#include <Dabble.h>
+#include <BTS7960.h>  // Include the BTS7960 library
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 32
+#define OLED_RESET -1
+#define SCREEN_ADDRESS 0x3C
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Pins for BTS7960 motor driver
+#define L_EN 5    // Left enable
+#define R_EN 6    // Right enable
+#define L_PWM 7   // Left PWM
+#define R_PWM 8   // Right PWM
+
+#define forwardIRPin 11
+#define backwardIRPin 10
+#define buzzer A0
+#define ResetPin A1
+
+// Thresholds and motor speeds
+#define maxSpeed 255
+#define minSpeed 80
+#define upperThresh 9.5
+#define lowerThresh 0
+
+BTS7960 motors(L_EN, R_EN, L_PWM, R_PWM);  // Use the 4-pin constructor for both motors
+
+// Flags and sensor variables
+bool upButton = false;
+bool downButton = false;
+bool leftButton = false;
+bool rightButton = false;
+bool squareButton = false;
+bool circleButton = false;
+bool selectButton = false;
+bool IROff = true;
+bool forwardStop = false;
+bool backwardStop = false;
+int speed = 0;
+double yaxis = 0;
+double xaxis = 0;
+double zaxis = 0;
+
+void reset() {
+  pinMode(ResetPin, OUTPUT);
+}
+
+void singleCharDisplay(char c) {
+  if (leftButton || rightButton) {
+    return;
+  }
+  display.clearDisplay();
+  display.setCursor(56, 5);
+  display.setTextColor(WHITE);
+  display.setTextSize(4);
+  display.print(c);
+}
+
+void arrowDisplay(bool right) {
+  display.clearDisplay();
+  display.setCursor(32, 5);
+  display.setTextColor(WHITE);
+  display.setTextSize(4);
+  right ? display.print("<--") : display.print("-->");
+}
+
+void communications() {
+  Dabble.processInput();
+  yaxis = Sensor.getAccelerometerYaxis();
+  xaxis = Sensor.getAccelerometerXaxis();
+  zaxis = Sensor.getAccelerometerZaxis();
+  upButton = GamePad.isUpPressed();
+  downButton = GamePad.isDownPressed();
+  rightButton = GamePad.isRightPressed();
+  leftButton = GamePad.isLeftPressed();
+  squareButton = GamePad.isSquarePressed();
+  circleButton = GamePad.isCirclePressed();
+
+  if (GamePad.isStartPressed()) {
+    reset();
+  }
+
+  if (GamePad.isSelectPressed()) {
+    IROff = !IROff;
+    delay(200);
+    Notification.clear();
+    Notification.notifyPhone(String("Toggled"));
+  }
+}
+
+void speedControl() {
+  double diff = zaxis - xaxis;
+  speed = 30 * diff;
+  if (speed < minSpeed) {
+    speed = 0;
+  }
+  if (speed > maxSpeed) {
+    speed = maxSpeed;
+  }
+}
+
+void directionControl() {
+  double offset = 0;
+
+  if (leftButton) {
+    motors.TurnRight(speed);
+  } else if (rightButton) {
+    motors.TurnLeft(speed);
+  } else if (yaxis > lowerThresh && yaxis < upperThresh) {
+    offset = 30 * (yaxis - lowerThresh);
+    motors.TurnRight(speed + offset);
+  } else if (yaxis > -upperThresh && yaxis < -lowerThresh) {
+    offset = 30 * (yaxis + lowerThresh);
+    motors.TurnLeft(speed + offset);
+  } else if (yaxis > upperThresh) {
+    motors.TurnRight(maxSpeed);
+  } else if (yaxis < -upperThresh) {
+    motors.TurnLeft(maxSpeed);
+  }
+
+  if (downButton && !upButton) {
+    motors.TurnRight(0);
+  }
+}
+
+void runMotors() {
+  // No need to run any specific method, as TurnLeft/TurnRight will handle it
+}
+
+void stopMotors() {
+  motors.Stop();
+}
+
+void turn(int delayTime) {
+  runMotors();
+  delay(delayTime);
+  stopMotors();
+}
+
+void manageManoeuvre() {
+  if (squareButton) {
+    motors.TurnRight(maxSpeed);
+    if (upButton && !downButton) {
+      turn(1000);
+    } else {
+      turn(700);
+    }
+  }
+}
+
+void motorsControlWithoutIR() {
+  if (rightButton) {
+    arrowDisplay(true);
+    runMotors();
+  } else if (leftButton) {
+    arrowDisplay(false);
+    runMotors();
+  } else if (upButton && !downButton) {
+    runMotors();
+    singleCharDisplay('F');
+  } else if (!upButton && downButton) {
+    runMotors();
+    singleCharDisplay('R');
+  } else {
+    stopMotors();
+    singleCharDisplay('N');
+  }
+}
+
+void motorsControlWithIR() {
+  if (rightButton) {
+    arrowDisplay(true);
+    motors.TurnLeft(maxSpeed);
+    runMotors();
+  } else if (leftButton) {
+    arrowDisplay(false);
+    motors.TurnRight(maxSpeed);
+    runMotors();
+  } else if (upButton && !downButton) {
+    if (!forwardStop) {
+      runMotors();
+      singleCharDisplay('F');
+    } else if (forwardStop) {
+      stopMotors();
+      Notification.notifyPhone(String("Obstruction in front."));
+    }
+  } else if (!upButton && downButton) {
+    if (!backwardStop) {
+      runMotors();
+      singleCharDisplay('R');
+    } else if (backwardStop) {
+      stopMotors();
+      Notification.notifyPhone(String("Obstruction at the back."));
+    }
+  } else {
+    stopMotors();
+    singleCharDisplay('N');
+  }
+}
+
+void setup() {
+  Serial.begin(9600);
+
+  // Initialize the display
+  if (!display.begin(SSD1306_SWITCHCAPVCC, SCREEN_ADDRESS)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    for (;;)
+      ;  // Don't proceed, loop forever
+  }
+
+  display.display();
+  delay(100);
+  singleCharDisplay('N');
+  display.display();
+
+  Dabble.begin(9600);  // Initialize Dabble
+
+  pinMode(forwardIRPin, INPUT);
+  pinMode(backwardIRPin, INPUT);
+  pinMode(buzzer, OUTPUT);
+
+  Notification.clear();
+  Notification.setTitle("Obstacle Detection");
+}
+
+void loop() {
+  squareButton = false;
+  digitalRead(forwardIRPin) == HIGH ? forwardStop = false : forwardStop = true;
+  digitalRead(backwardIRPin) == HIGH ? backwardStop = false : backwardStop = true;
+
+  communications();
+
+  circleButton ? digitalWrite(buzzer, HIGH) : digitalWrite(buzzer, LOW);
+
+  directionControl();
+  speedControl();
+  manageManoeuvre();
+
+  IROff ? motorsControlWithoutIR() : motorsControlWithIR();
+
+  display.display();
+}
